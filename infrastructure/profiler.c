@@ -35,6 +35,12 @@
 	" [-c core to monitor] \n"                                             \
 	" bmark1;arg1;arg2;... bmark2;arg1;arg2;..."
 
+struct perf_counter_set {
+	int events[MAX_PERF_EVENTS];
+	int types[MAX_PERF_EVENTS];
+	char *names[MAX_PERF_EVENTS];
+};
+
 int default_perf_events_list[MAX_PERF_EVENTS] = { PERF_COUNT_HW_CACHE_MISSES,
 						  PERF_COUNT_HW_INSTRUCTIONS,
 						  PERF_COUNT_HW_BRANCH_MISSES,
