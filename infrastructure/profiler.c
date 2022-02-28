@@ -27,6 +27,22 @@
 #define DEFAULT_CYCLES 256
 #define BUFLEN 256
 #define MAX_PERF_EVENTS 10
+#define WRITE_CSV_HEADER 1
+
+#define USAGE_STR                                                              \
+	"Usage: %s -o <output file> [-p cycles]"                               \
+	" [-n how many perf events] [-m array of events]"                      \
+	" [-c core to monitor] \n"                                             \
+	" bmark1;arg1;arg2;... bmark2;arg1;arg2;..."
+
+int default_perf_events_list[MAX_PERF_EVENTS] = { PERF_COUNT_HW_CACHE_MISSES,
+						  PERF_COUNT_HW_INSTRUCTIONS,
+						  PERF_COUNT_HW_BRANCH_MISSES,
+						  PERF_COUNT_SW_PAGE_FAULTS };
+int perf_event_type_list[MAX_PERF_EVENTS] = { PERF_TYPE_HARDWARE,
+					      PERF_TYPE_HARDWARE,
+					      PERF_TYPE_HARDWARE,
+					      PERF_TYPE_SOFTWARE };
 
 int running_bms = 0;
 pid_t pids[MAX_BENCHMARKS];
@@ -35,7 +51,7 @@ volatile int done = 0;
 struct perf_event_attr perf_event_attrs[MAX_PERF_EVENTS];
 int perf_fds[MAX_PERF_EVENTS];
 uint64_t perf_ids[MAX_PERF_EVENTS];
-unsigned long long *perf_data[MAX_PERF_EVENTS];
+unsigned long long perf_data[MAX_PERF_EVENTS];
 
 static inline unsigned long get_timing(void)
 {
@@ -43,14 +59,6 @@ static inline unsigned long get_timing(void)
 	asm volatile("rdtsc" : "=a"(a), "=d"(d));
 	return ((unsigned long)a) | (((unsigned long)d) << 32);
 }
-
-#define WRITE_CSV_HEADER 1
-
-#define USAGE_STR                                                              \
-	"Usage: %s -o <output file> [-p cycles]"                               \
-	" [-n how many perf events] [-m array of events]"                      \
-	" [-c core to monitor] \n"                                             \
-	" bmark1;arg1;arg2;... bmark2;arg1;arg2;..."
 
 /* Function to spawn all the listed benchmarks */
 void launch_benchmark(char *bm, int bm_id)
@@ -69,7 +77,7 @@ void launch_benchmark(char *bm, int bm_id)
 
 		/* To follow execv's convention*/
 		while (bm && p < MAX_PARAMS - 1) {
-			args[p++] = strsep(&bm, ";");
+			args[p++] = strsep(&bm, " ");
 		}
 		args[p] = NULL;
 
@@ -181,9 +189,9 @@ void perf_event_setup(char *perf_attr_type[], int perf_event_count,
 	for (i = 0; i < perf_event_count; i++) {
 		pe = perf_event_attrs + i;
 		memset(pe, 0, sizeof(struct perf_event_attr));
-		pe->type = PERF_TYPE_HARDWARE;
+		pe->type = perf_event_type_list[i];
 		pe->size = sizeof(struct perf_event_attr);
-		pe->config = PERF_COUNT_HW_CACHE_MISSES;
+		pe->config = default_perf_events_list[i];
 		pe->disabled = 1;
 		pe->exclude_kernel = 1;
 		pe->exclude_hv = 1;
@@ -194,6 +202,7 @@ void perf_event_setup(char *perf_attr_type[], int perf_event_count,
 			exit(EXIT_FAILURE);
 		}
 	}
+	fprintf(stderr, "perf event open\n");
 }
 
 //Print the value of the counters in a csv file.
@@ -203,6 +212,7 @@ void report_perf_events(int outfd, char **perf_events, int perf_events_count,
 	int i;
 	// print header of csv file
 	char *header_init = "benchmark,";
+	fprintf(stderr, "printing a row\n");
 	if (needs_header == WRITE_CSV_HEADER) {
 		dprintf(outfd, "%s", header_init);
 		for (i = 0; i < perf_events_count; i++) {
@@ -223,22 +233,26 @@ void report_perf_events(int outfd, char **perf_events, int perf_events_count,
 		}
 	}
 	dprintf(outfd, "\n");
+	fprintf(stderr, "printed a row\n");
 }
 
 //Start counting events in the opened counters.
 void perf_event_start(int perf_event_count)
 {
 	int i;
+	fprintf(stderr, "starting perf events monitoring\n");
 	for (i = 0; i < perf_event_count; i++) {
 		ioctl(perf_fds[i], PERF_EVENT_IOC_RESET, 0);
 		ioctl(perf_fds[i], PERF_EVENT_IOC_ENABLE, 0);
 	}
+	fprintf(stderr, "started perf events monitoring\n");
 }
 
 //Stop counting events, and read the counters value.
 void perf_event_stop(int perf_event_count)
 {
 	int i, ret;
+	fprintf(stderr, "stopping per events monitoring\n");
 	for (i = 0; i < perf_event_count; i++) {
 		ioctl(perf_fds[i], PERF_EVENT_IOC_DISABLE, 0);
 		ret = read(perf_fds[i], perf_data + i,
@@ -247,6 +261,7 @@ void perf_event_stop(int perf_event_count)
 			perror("Error, cannot read perf counter");
 		}
 	}
+	fprintf(stderr, "stopped per events monitoring\n");
 }
 
 int main(int argc, char **argv)
@@ -258,9 +273,12 @@ int main(int argc, char **argv)
 	void *mem;
 	int bm_count = 0;
 	int i = 0;
-	unsigned core_id = 0;
-	int perf_event_count = 0;
-	char *perf_events[MAX_PERF_EVENTS * 2];
+	unsigned core_id = -1;
+	int perf_event_count = 4;
+	char *perf_events[MAX_PERF_EVENTS * 2] = {
+		"PERF_COUNT_HW_CACHE_MISSES", "PERF_COUNT_HW_INSTRUCTIONS",
+		"PERF_COUNT_HW_BRANCH_MISSES", "PERF_COUNT_SW_PAGE_FAULTS"
+	};
 	int file_needs_header = ~WRITE_CSV_HEADER;
 	int file_common_flags = 0 | O_RDWR | O_CLOEXEC;
 	/* Get input from user */
