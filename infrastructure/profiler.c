@@ -3,7 +3,6 @@
  * 
  * Copyright (c) Boston University
  */
-
 #include <stdio.h>
 #include <unistd.h>
 #include <getopt.h>
@@ -18,16 +17,27 @@
 #include <sched.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <semaphore.h>
+#include <errno.h>
+#include <time.h>
 #include <linux/perf_event.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
+#include <sys/types.h>
 
 #define MAX_BENCHMARKS 10
 #define MAX_PARAMS 10
 #define DEFAULT_CYCLES 256
 #define BUFLEN 256
-#define MAX_PERF_EVENTS 10
 #define WRITE_CSV_HEADER 1
+#define NANOSECONDS (1UL)
+#define MICROSECONDS (1000 * NANOSECONDS)
+#define MILLISECONDS (1000 * MICROSECONDS)
+#define SECONDS (1000 * MILLISECONDS)
+#define MINUTES (60 * SECONDS)
+#define PERF_EVENTS_NUM 5
+#define SHM_PATH "/stap_func_id"
+#define SHM_SIZE 512
 
 #define USAGE_STR                                                              \
 	"Usage: %s -o <output file> [-p cycles]"                               \
@@ -35,29 +45,46 @@
 	" [-c core to monitor] \n"                                             \
 	" bmark1;arg1;arg2;... bmark2;arg1;arg2;..."
 
-struct perf_counter_set {
-	int events[MAX_PERF_EVENTS];
-	int types[MAX_PERF_EVENTS];
-	char *names[MAX_PERF_EVENTS];
-};
-
-int default_perf_events_list[MAX_PERF_EVENTS] = { PERF_COUNT_HW_CACHE_MISSES,
-						  PERF_COUNT_HW_INSTRUCTIONS,
-						  PERF_COUNT_HW_BRANCH_MISSES,
-						  PERF_COUNT_SW_PAGE_FAULTS };
-int perf_event_type_list[MAX_PERF_EVENTS] = { PERF_TYPE_HARDWARE,
-					      PERF_TYPE_HARDWARE,
-					      PERF_TYPE_HARDWARE,
-					      PERF_TYPE_SOFTWARE };
-
 int running_bms = 0;
 pid_t pids[MAX_BENCHMARKS];
 uint64_t start_ts[MAX_BENCHMARKS];
 volatile int done = 0;
-struct perf_event_attr perf_event_attrs[MAX_PERF_EVENTS];
-int perf_fds[MAX_PERF_EVENTS];
-uint64_t perf_ids[MAX_PERF_EVENTS];
-unsigned long long perf_data[MAX_PERF_EVENTS];
+int file_needs_header = WRITE_CSV_HEADER;
+int outfd = -1;
+char *current_bm;
+
+struct perf_counter_set {
+	int events[PERF_EVENTS_NUM];
+	int types[PERF_EVENTS_NUM];
+	char *names[PERF_EVENTS_NUM];
+};
+
+static struct perf_event_attr perf_event_attrs[PERF_EVENTS_NUM];
+static int perf_fds[PERF_EVENTS_NUM];
+static uint64_t perf_ids[PERF_EVENTS_NUM];
+static unsigned long long perf_data[PERF_EVENTS_NUM];
+
+static void *shm_addr = NULL;
+int shm_fd = -1;
+
+static int default_perf_events_list[PERF_EVENTS_NUM] = {
+	PERF_COUNT_HW_CACHE_MISSES, PERF_COUNT_HW_CACHE_REFERENCES,
+	PERF_COUNT_HW_INSTRUCTIONS, PERF_COUNT_HW_BRANCH_MISSES,
+	PERF_COUNT_SW_PAGE_FAULTS
+};
+
+static int perf_event_type_list[PERF_EVENTS_NUM] = {
+	PERF_TYPE_HARDWARE, PERF_TYPE_HARDWARE, PERF_TYPE_HARDWARE,
+	PERF_TYPE_HARDWARE, PERF_TYPE_SOFTWARE
+};
+
+char *perf_events[PERF_EVENTS_NUM] = { "cache misses", "cache references",
+				       "retired instructions", "branch misses",
+				       "page faults" };
+
+static timer_t timer;
+
+static unsigned long counters_first_values[PERF_EVENTS_NUM] = { 0 };
 
 static inline unsigned long get_timing(void)
 {
@@ -187,12 +214,11 @@ static long perf_event_open(struct perf_event_attr *event_type, pid_t pid,
 }
 
 //Setup the datastructures to open the perf events counters and open them.
-void perf_event_setup(char *perf_attr_type[], int perf_event_count,
-		      pid_t target_pid, int cpuid)
+void perf_event_setup(pid_t target_pid, int cpuid)
 {
 	int i;
 	struct perf_event_attr *pe;
-	for (i = 0; i < perf_event_count; i++) {
+	for (i = 0; i < PERF_EVENTS_NUM; i++) {
 		pe = perf_event_attrs + i;
 		memset(pe, 0, sizeof(struct perf_event_attr));
 		pe->type = perf_event_type_list[i];
@@ -212,80 +238,203 @@ void perf_event_setup(char *perf_attr_type[], int perf_event_count,
 }
 
 //Print the value of the counters in a csv file.
-void report_perf_events(int outfd, char **perf_events, int perf_events_count,
-			char *bm, int needs_header)
+void report_perf_events(char *func)
 {
 	int i;
 	// print header of csv file
-	char *header_init = "benchmark,";
-	fprintf(stderr, "printing a row\n");
-	if (needs_header == WRITE_CSV_HEADER) {
+	char *header_init = "benchmark,function,";
+	//fprintf(stderr, "printing a row\n");
+	if (file_needs_header == WRITE_CSV_HEADER) {
 		dprintf(outfd, "%s", header_init);
-		for (i = 0; i < perf_events_count; i++) {
+		for (i = 0; i < PERF_EVENTS_NUM; i++) {
 			dprintf(outfd, "%s", perf_events[i]);
-			if (i + 1 < perf_events_count) {
+			if (i + 1 < PERF_EVENTS_NUM) {
 				dprintf(outfd, ",");
 			}
 		}
 		dprintf(outfd, "\n");
 	}
-	//print the counter values, one benchmark per line
-	dprintf(outfd, "%s,", bm);
+	//print the counter values, measurement per line
+	dprintf(outfd, "%s,%s,", current_bm, func);
 
-	for (i = 0; i < perf_events_count; i++) {
+	for (i = 0; i < PERF_EVENTS_NUM; i++) {
 		dprintf(outfd, "%llu", perf_data[i]);
-		if (i + 1 < perf_events_count) {
+		if (i + 1 < PERF_EVENTS_NUM) {
 			dprintf(outfd, ",");
 		}
 	}
 	dprintf(outfd, "\n");
-	fprintf(stderr, "printed a row\n");
+	//fprintf(stderr, "printed a row\n");
 }
 
-//Start counting events in the opened counters.
-void perf_event_start(int perf_event_count)
-{
-	int i;
-	fprintf(stderr, "starting perf events monitoring\n");
-	for (i = 0; i < perf_event_count; i++) {
-		ioctl(perf_fds[i], PERF_EVENT_IOC_RESET, 0);
-		ioctl(perf_fds[i], PERF_EVENT_IOC_ENABLE, 0);
-	}
-	fprintf(stderr, "started perf events monitoring\n");
-}
-
-//Stop counting events, and read the counters value.
-void perf_event_stop(int perf_event_count)
+//read data from perf counters
+void perf_event_read_counters(void)
 {
 	int i, ret;
-	fprintf(stderr, "stopping per events monitoring\n");
-	for (i = 0; i < perf_event_count; i++) {
-		ioctl(perf_fds[i], PERF_EVENT_IOC_DISABLE, 0);
+	for (i = 0; i < PERF_EVENTS_NUM; i++) {
 		ret = read(perf_fds[i], perf_data + i,
 			   sizeof(unsigned long long));
 		if (ret == -1) {
 			perror("Error, cannot read perf counter");
 		}
+		perf_data[i] = perf_data[i] - counters_first_values[i];
+	}
+}
+
+//Start counting events in the opened counters.
+void perf_event_start(void)
+{
+	int i;
+	fprintf(stderr, "starting perf events monitoring\n");
+	for (i = 0; i < PERF_EVENTS_NUM; i++) {
+		ioctl(perf_fds[i], PERF_EVENT_IOC_RESET, 0);
+		ioctl(perf_fds[i], PERF_EVENT_IOC_ENABLE, 0);
+		counters_first_values[i] = 0;
+	}
+	fprintf(stderr, "started perf events monitoring\n");
+	perf_event_read_counters();
+	//setup the counters first values
+	for (i = 0; i < PERF_EVENTS_NUM; i++) {
+		counters_first_values[i] = perf_data[i];
+	}
+}
+
+//Stop counting events, and read the counters value.
+void perf_event_stop(void)
+{
+	int i, ret;
+	fprintf(stderr, "stopping perf events monitoring\n");
+	for (i = 0; i < PERF_EVENTS_NUM; i++) {
+		ioctl(perf_fds[i], PERF_EVENT_IOC_DISABLE, 0);
 	}
 	fprintf(stderr, "stopped per events monitoring\n");
+}
+
+static void sampling(int signo, siginfo_t *siginfo, void *dummy)
+{
+	int i;
+	char func[SHM_SIZE];
+	//read the function name
+	memcpy(func, shm_addr, sizeof(char) * SHM_SIZE);
+	//read the counters
+	perf_event_read_counters();
+	report_perf_events(func);
+	//after reporting the first time we don't need to reprint the csv header
+	file_needs_header = ~WRITE_CSV_HEADER;
+}
+
+int setup_perf_sampler(void)
+{
+	struct sigaction sa;
+	int res = 0, i;
+	struct sigevent event;
+	// setup signal handler
+	// we set the signals to ignore while handling the specified signal
+	res = sigemptyset(&sa.sa_mask);
+	if (res == -1) {
+		perror("Error during sigemptyset for signal handler");
+		return res;
+	}
+	// we mask SIGRTMIN
+	res = sigaddset(&sa.sa_mask, SIGRTMIN);
+	if (res == -1) {
+		perror("Error during sigaddset for signal handler");
+		return res;
+	}
+	// install the signal handler.
+	sa.sa_flags = SA_SIGINFO;
+	sa.sa_sigaction = sampling;
+	res = sigaction(SIGRTMIN, &sa, NULL);
+	if (res == -1) {
+		perror("Error during signal handler installation");
+		return res;
+	}
+	memset(&event, 0, sizeof(event));
+	// the timer will generate a signal
+	event.sigev_notify = SIGEV_SIGNAL;
+	// the signal generated by the timer
+	event.sigev_signo = SIGRTMIN;
+	// creation of the timer
+	res = timer_create(CLOCK_REALTIME, &event, &timer);
+	if (res != 0) {
+		perror("Error during HR timer creation");
+		return res;
+	}
+	//open the shared memory file
+
+	shm_fd = shm_open(SHM_PATH, O_RDONLY, S_IRUSR | S_IRGRP | S_IROTH);
+	if (shm_fd == -1) {
+		perror("error during shm open");
+		return shm_fd;
+	}
+
+	// map shared memory
+	shm_addr = mmap(NULL, SHM_SIZE, PROT_READ, MAP_SHARED, shm_fd, 0);
+	if (shm_addr == MAP_FAILED) {
+		perror("shm mmap failed");
+		return -1;
+	}
+	return res;
+}
+
+/// Assumes stop has been performed before
+void teardown_perf_sampler(void)
+{
+	int res = timer_delete(timer);
+	if (res < 0) {
+		perror("Error during period timer deletion");
+	}
+	munmap(shm_addr, SHM_SIZE);
+	close(shm_fd);
+}
+
+void start_sampling(unsigned long it_input_time_s,
+		    unsigned long it_input_time_ns,
+		    unsigned long val_input_time_s,
+		    unsigned long val_input_time_ns)
+{
+	int res;
+	struct itimerspec timer_spec;
+	perf_event_start();
+	timer_spec.it_interval.tv_sec = it_input_time_s;
+	timer_spec.it_interval.tv_nsec = it_input_time_ns;
+	//start sampling ASAP
+	timer_spec.it_value.tv_sec = val_input_time_s;
+	timer_spec.it_value.tv_nsec = val_input_time_ns;
+	res = timer_settime(timer, 0, &timer_spec, NULL);
+	if (res < 0) {
+		perror("Error during timer setup");
+		exit(EXIT_FAILURE);
+	}
+	printf("sampling started\n");
+}
+
+void stop_sampling(void)
+{
+	int res;
+	struct itimerspec timer_spec;
+	memset(&timer_spec, 0, sizeof(struct itimerspec));
+	res = timer_settime(timer, 0, &timer_spec, NULL);
+	if (res < 0) {
+		perror("Error during timer setup");
+		exit(EXIT_FAILURE);
+	}
+	perf_event_stop();
+	printf("sampling stopped\n");
 }
 
 int main(int argc, char **argv)
 {
 	char *strbuffer = NULL;
-	int outfd = -1, memfd, opt;
+	int memfd, opt;
 	unsigned long cycles = DEFAULT_CYCLES;
 	char *bms[MAX_BENCHMARKS];
 	void *mem;
 	int bm_count = 0;
 	int i = 0;
+	int res;
 	unsigned core_id = -1;
 	int perf_event_count = 4;
-	char *perf_events[MAX_PERF_EVENTS * 2] = {
-		"PERF_COUNT_HW_CACHE_MISSES", "PERF_COUNT_HW_INSTRUCTIONS",
-		"PERF_COUNT_HW_BRANCH_MISSES", "PERF_COUNT_SW_PAGE_FAULTS"
-	};
-	int file_needs_header = ~WRITE_CSV_HEADER;
 	int file_common_flags = 0 | O_RDWR | O_CLOEXEC;
 	/* Get input from user */
 	while ((opt = getopt(argc, argv, "-o:p:c:m:n:")) != -1) {
@@ -351,25 +500,31 @@ int main(int argc, char **argv)
 	}
 
 	// open the perf counters
-	perf_event_setup(perf_events, perf_event_count, pids[0], core_id);
+	perf_event_setup(pids[0], core_id);
+	if (res < 0) {
+		return res;
+	}
+	res = setup_perf_sampler();
+	if (res < 0) {
+		return res;
+	}
 
 	for (i = 0; i < bm_count; i++) {
 		/* Now that profiling has been started, kick off the benchmarks */
+		current_bm = bms[i];
 		launch_benchmark(bms[i], i);
 
 		/* Start Monitoring */
-		perf_event_start(perf_event_count);
-
+		start_sampling(0, 100 * MICROSECONDS, 0, 200 * MILLISECONDS);
 		/* Wait for bms to finish */
 		wait_completion();
 
 		/* Stop Monitoring*/
-		perf_event_stop(perf_event_count);
-		report_perf_events(outfd, perf_events, perf_event_count, bms[i],
-				   file_needs_header);
-		//after reporting the first time we don't need to reprint the csv header
-		file_needs_header = ~WRITE_CSV_HEADER;
+		stop_sampling();
 	}
+	teardown_perf_sampler();
+	printf("synching output file\n");
+	fsync(outfd);
 	if (outfd >= 0)
 		close(outfd);
 

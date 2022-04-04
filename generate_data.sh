@@ -9,29 +9,42 @@ if [ "$EUID" -ne 0 ]; then
 fi
 for bench in "${BENCHMARKS[@]}"; do
   for data in "${INPUTS[@]}"; do
-    make -C "infrastructure/rt-bench/vision/benchmarks/${bench}/data/${data}" compile
+    make -C "infrastructure/rt-bench/vision/benchmarks/${bench}/data/${data}" debug
     if [ $? -gt 0 ]; then
       echo "Cannot compile ${bench} with input size ${data}!"
       exit
     fi
   done
 done
-make
+make -C infrastructure
+if [ $? -gt 0 ]; then
+  echo "Cannot compile the profiler"
+  exit
+fi
 for bench in "${BENCHMARKS[@]}"; do
   for data in "${INPUTS[@]}"; do
-    TARGET_BMARKS=("${TARGET_BMARKS[@]}" "$CURRENT_PATH/infrastructure/rt-bench/vision/benchmarks/${bench}/data/${data}/${bench} -p 1 -d 1 -t 1 -b infrastructure/rt-bench/vision/benchmarks/${bench}/data/${data}")
+    TARGET_BMARKS=("${TARGET_BMARKS[@]}" "$CURRENT_PATH/infrastructure/rt-bench/vision/benchmarks/${bench}/data/${data}/${bench}")
+    BMARKS_ARGS=("${BMARKS_ARGS[@]}" "-p 1 -d 1 -t 1 -b infrastructure/rt-bench/vision/benchmarks/${bench}/data/${data}")
   done
 done
-OUTPUT="$CURRENT_PATH/data/1st_run.csv"
+OUTPUT="$CURRENT_PATH/data/2nd_run.csv"
 mkdir -p $CURRENT_PATH/data
-for ((i = 0; i < 100; i++)); do
-  for bench in "${TARGET_BMARKS[@]}"; do
-    $CURRENT_PATH/infrastructure/profiler -o "$OUTPUT" "$bench"
+for i in "${!TARGET_BMARKS[@]}"; do
+  stap -vg $CURRENT_PATH/infrastructure/shm.stap ${TARGET_BMARKS[i]} &
+  if [ $? -gt 0 ]; then
+    echo "Cannot start systemtamp for ${TARGET_BMARKS[i]}!"
+    exit
+  fi
+  sleep 3
+  for ((j = 0; j < 5; j++)); do
+    $CURRENT_PATH/infrastructure/profiler -o "$OUTPUT" "${TARGET_BMARKS[i]} ${BMARKS_ARGS[i]}"
     if [ $? -gt 0 ]; then
-      echo "Cannot profile ${bench}!"
+      echo "Cannot profile ${TARGET_BMARKS[i]}!"
+      killall stap
       exit
     fi
   done
+  killall stap
 done
 chmod +rw -R "$OUTPUT"
 if [ $? -gt 0 ]; then
