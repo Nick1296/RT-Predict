@@ -2,6 +2,8 @@
 CURRENT_PATH=$(pwd)
 BENCHMARKS=("disparity" "mser" "localization" "tracking" "sift")
 INPUTS=("sim_fast" "sim" "sqcif" "cif" "vga")
+#BENCHMARKS=("disparity")
+#INPUTS=("vga")
 TARGET_BMARKS=()
 if [ "$EUID" -ne 0 ]; then
   echo "This script must be run as root to allow the tests to succeed"
@@ -27,7 +29,7 @@ for bench in "${BENCHMARKS[@]}"; do
     BMARKS_ARGS=("${BMARKS_ARGS[@]}" "-p 1 -d 1 -t 1 -b infrastructure/rt-bench/vision/benchmarks/${bench}/data/${data}")
   done
 done
-OUTPUT="$CURRENT_PATH/data/2nd_run.csv"
+OUTPUT="$CURRENT_PATH/data/10_runs_5_inputs_5_bmarks_raw.csv"
 mkdir -p $CURRENT_PATH/data
 for i in "${!TARGET_BMARKS[@]}"; do
   stap -vg $CURRENT_PATH/infrastructure/shm.stap ${TARGET_BMARKS[i]} &
@@ -35,8 +37,8 @@ for i in "${!TARGET_BMARKS[@]}"; do
     echo "Cannot start systemtamp for ${TARGET_BMARKS[i]}!"
     exit
   fi
-  sleep 3
-  for ((j = 0; j < 5; j++)); do
+  sleep 10
+  for ((j = 0; j < 10; j++)); do
     $CURRENT_PATH/infrastructure/profiler -o "$OUTPUT" "${TARGET_BMARKS[i]} ${BMARKS_ARGS[i]}"
     if [ $? -gt 0 ]; then
       echo "Cannot profile ${TARGET_BMARKS[i]}!"

@@ -38,6 +38,7 @@
 #define PERF_EVENTS_NUM 5
 #define SHM_PATH "/stap_func_id"
 #define SHM_SIZE 512
+#define TARGET_STARTED 1
 
 #define USAGE_STR                                                              \
 	"Usage: %s -o <output file> [-p cycles]"                               \
@@ -51,7 +52,8 @@ uint64_t start_ts[MAX_BENCHMARKS];
 volatile int done = 0;
 int file_needs_header = WRITE_CSV_HEADER;
 int outfd = -1;
-char *current_bm;
+char *bm_path, *bm_name, *bm_input;
+int target_started;
 
 struct perf_counter_set {
 	int events[PERF_EVENTS_NUM];
@@ -96,6 +98,7 @@ static inline unsigned long get_timing(void)
 /* Function to spawn all the listed benchmarks */
 void launch_benchmark(char *bm, int bm_id)
 {
+	int res;
 	/* Launch all the BMs one by one */
 	pid_t cpid = fork();
 	if (cpid == -1) {
@@ -125,13 +128,44 @@ void launch_benchmark(char *bm, int bm_id)
 	/* Parent process */
 	else {
 		/* Keep track of the new bm that has been launched */
-		printf("Running: %s (PID = %d)\n", bm, cpid);
+		printf("Launched: %s (PID = %d)\n", bm, cpid);
+		res = kill(cpid, SIGSTOP);
+		if (res < 0) {
+			perror("cannot pause monitoring benchmark");
+		}
+		printf("Paused: %s (PID = %d)\n", bm, cpid);
 
 		start_ts[bm_id] = get_timing();
 		pids[bm_id] = cpid;
 		running_bms++;
 		done = 0;
 		//cpid_arr[i*NUM_SD_VBS_BENCHMARKS_DATASETS+j] = cpid;
+		//get benchmark name and get also input size if we have SD-VBS from rt-bench
+		bm_path = malloc(sizeof(char) * strlen(bm) + 1);
+		memset(bm_path, 0, strlen(bm) + 1);
+		strcpy(bm_path, bm);
+		int SD_VBS = 0, rtbench = 0;
+		char *token;
+		token = strsep(&bm_path, " ");
+		bm_path = token;
+		while (token != NULL) {
+			if (strcmp(token, "rt-bench") == 0) {
+				rtbench = 1;
+			}
+			if (rtbench) {
+				if (strcmp(token, "vision") == 0) {
+					SD_VBS = 1;
+				}
+			}
+
+			token = strsep(&bm_path, "/");
+			if (token != NULL) {
+				if (SD_VBS) {
+					bm_input = bm_name;
+				}
+				bm_name = token;
+			}
+		}
 	}
 
 	(void)pids;
@@ -229,8 +263,9 @@ void perf_event_setup(pid_t target_pid, int cpuid)
 		pe->exclude_hv = 1;
 		perf_fds[i] = perf_event_open(pe, target_pid, cpuid, -1, 0);
 		if (perf_fds[i] == -1) {
-			fprintf(stderr, "Error opening leader %llx\n",
-				pe->config);
+			fprintf(stderr,
+				"Error opening leader %llx for counter num %d\n",
+				pe->config, i);
 			exit(EXIT_FAILURE);
 		}
 	}
@@ -242,7 +277,7 @@ void report_perf_events(char *func)
 {
 	int i;
 	// print header of csv file
-	char *header_init = "benchmark,function,";
+	char *header_init = "benchmark,input,pid,function,";
 	//fprintf(stderr, "printing a row\n");
 	if (file_needs_header == WRITE_CSV_HEADER) {
 		dprintf(outfd, "%s", header_init);
@@ -254,8 +289,9 @@ void report_perf_events(char *func)
 		}
 		dprintf(outfd, "\n");
 	}
+
 	//print the counter values, measurement per line
-	dprintf(outfd, "%s,%s,", current_bm, func);
+	dprintf(outfd, "%s,%s,%s,", bm_name, bm_input, func);
 
 	for (i = 0; i < PERF_EVENTS_NUM; i++) {
 		dprintf(outfd, "%llu", perf_data[i]);
@@ -271,13 +307,19 @@ void report_perf_events(char *func)
 void perf_event_read_counters(void)
 {
 	int i, ret;
+	unsigned long long tmp[PERF_EVENTS_NUM];
 	for (i = 0; i < PERF_EVENTS_NUM; i++) {
-		ret = read(perf_fds[i], perf_data + i,
-			   sizeof(unsigned long long));
+		ret = read(perf_fds[i], tmp + i, sizeof(unsigned long long));
 		if (ret == -1) {
-			perror("Error, cannot read perf counter");
+			perror("Error, cannot read counter");
 		}
-		perf_data[i] = perf_data[i] - counters_first_values[i];
+		if (tmp[i] - counters_first_values[i] > 0) {
+			perf_data[i] = tmp[i] - counters_first_values[i];
+		} else {
+			fprintf(stderr,
+				"WARNING: %s counter has an invalid value\n",
+				perf_events[i]);
+		}
 	}
 }
 
@@ -299,7 +341,7 @@ void perf_event_start(void)
 	}
 }
 
-//Stop counting events, and read the counters value.
+//Stop counting events
 void perf_event_stop(void)
 {
 	int i, ret;
@@ -310,17 +352,32 @@ void perf_event_stop(void)
 	fprintf(stderr, "stopped per events monitoring\n");
 }
 
+void perf_event_close(void)
+{
+	int i;
+	for (i = 0; i < PERF_EVENTS_NUM; i++) {
+		close(perf_fds[i]);
+	}
+}
+
 static void sampling(int signo, siginfo_t *siginfo, void *dummy)
 {
 	int i;
 	char func[SHM_SIZE];
 	//read the function name
 	memcpy(func, shm_addr, sizeof(char) * SHM_SIZE);
-	//read the counters
-	perf_event_read_counters();
-	report_perf_events(func);
-	//after reporting the first time we don't need to reprint the csv header
-	file_needs_header = ~WRITE_CSV_HEADER;
+	//check if the target application has started
+	if (target_started != TARGET_STARTED &&
+	    strcmp(func, "-1,systemtap_setup") != 0) {
+		target_started = TARGET_STARTED;
+	}
+	if (target_started == TARGET_STARTED) {
+		//read the counters
+		perf_event_read_counters();
+		report_perf_events(func);
+		//after reporting the first time we don't need to reprint the csv header
+		file_needs_header = ~WRITE_CSV_HEADER;
+	}
 }
 
 int setup_perf_sampler(void)
@@ -460,8 +517,9 @@ int main(int argc, char **argv)
 					perror("Cannot create output file");
 					exit(EXIT_FAILURE);
 				}
+			} else {
+				file_needs_header = ~WRITE_CSV_HEADER;
 			}
-
 			free(strbuffer);
 			break;
 		case 'p':
@@ -499,11 +557,6 @@ int main(int argc, char **argv)
 		}
 	}
 
-	// open the perf counters
-	perf_event_setup(pids[0], core_id);
-	if (res < 0) {
-		return res;
-	}
 	res = setup_perf_sampler();
 	if (res < 0) {
 		return res;
@@ -511,16 +564,24 @@ int main(int argc, char **argv)
 
 	for (i = 0; i < bm_count; i++) {
 		/* Now that profiling has been started, kick off the benchmarks */
-		current_bm = bms[i];
+		target_started = ~TARGET_STARTED;
 		launch_benchmark(bms[i], i);
+		// open the perf counters
+		perf_event_setup(pids[i], core_id);
 
 		/* Start Monitoring */
-		start_sampling(0, 100 * MICROSECONDS, 0, 200 * MILLISECONDS);
+		start_sampling(0, 100 * MICROSECONDS, 0, 1);
+		res = kill(pids[i], SIGCONT);
+		if (res < 0) {
+			perror("cannot resume monitored benchmark");
+		}
+		printf("Restarted: %s (PID = %d)\n", bms[i], pids[i]);
 		/* Wait for bms to finish */
 		wait_completion();
 
 		/* Stop Monitoring*/
 		stop_sampling();
+		perf_event_close();
 	}
 	teardown_perf_sampler();
 	printf("synching output file\n");

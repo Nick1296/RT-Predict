@@ -8,10 +8,10 @@
   struct file* shmemfp = NULL;
 %}
 
-function update_shmem (name:string) %{
+function update_shmem (pid:long,name:string) %{
          char to_write[512];
          memset(to_write,0,512);
-         snprintf(to_write,511,"%s",STAP_ARG_name);
+         snprintf(to_write,511,"%lld,%s",STAP_ARG_pid,STAP_ARG_name);
          vfs_llseek(shmemfp,0,SEEK_SET);
          kernel_write(shmemfp,to_write,sizeof(char)*512,&(shmemfp->f_pos));
          vfs_fsync(shmemfp, 0);
@@ -22,7 +22,7 @@ function setup() %{
   //shmemfp=shmem_file_setup("/dev/shm/stap_func_id",512,0);
   shmemfp=filp_open("/dev/shm/stap_func_id",O_CREAT | O_TRUNC | O_RDWR,0666);
   printk("shmemfp:%p\n",shmemfp);
-%} 
+%}
 
 function teardown() %{
       struct inode *parent_inode = shmemfp->f_path.dentry->d_parent->d_inode, *delegated_inode=NULL;
@@ -35,11 +35,12 @@ function teardown() %{
 
 probe begin {
   setup()
+  update_shmem(-1,"systemtap_setup");
 }
 
 probe process(@1).function("*").call {
-      //printf("Called %s",probefunc())
-      update_shmem(probefunc())
+      //printf("Called %s\n",probefunc())
+      update_shmem(pid(),probefunc())
       //printf(" %p\n",ustack(-1))
       //printf("wrote info on shared memory\n")
       //printf("%s\n\n",ucallers(-1))
@@ -47,8 +48,8 @@ probe process(@1).function("*").call {
 }
 
 probe process(@1).function("*").return {
-      //printf("return to %s",probefunc())
-      update_shmem(probefunc())
+      //printf("return to %s\n",probefunc())
+      update_shmem(pid(),probefunc())
       //printf(" %p\n",ustack(-1))
       //printf(" wrote info on shared memory\n")
       //printf(" %s\n\n",ucallers(-1))
