@@ -3,6 +3,7 @@ import pickle
 
 import numpy as np
 from tqdm.auto import tqdm
+import matplotlib.pyplot as plt
 
 # column numbers
 bmark = 0
@@ -96,6 +97,55 @@ def read_datafile(file_name):
     outfile.close()
     return data, columns
 
+
+def plot_execution(fn):
+    pkl_fn = data_path + "cleaned_data_no_header.pkl"
+    if os.path.exists(pkl_fn):
+        data_fd = open(pkl_fn, mode='rb')
+        data = pickle.load(data_fd)
+    else:
+        data, cols = read_datafile(data_path + "single_run_test.csv")
+
+    labels=["cache misses", "cache references"]
+    #For each counter have a different plot
+    for cnt in range(2):
+        x = []
+        y = []
+        func_line = []
+        func_nm = []
+        x.append(0)
+        y.append(0)
+        prev_func_nm = ""
+        # loop through the data to build the x and y for the cummulative graphs.
+        for row in data[0:1000]:
+            elapsed_time = x[-1] + row[5]
+            y_val = y[-1] + row[cnt + 6]
+
+            if(row[3] != prev_func_nm):
+                func_line.append(elapsed_time)
+                func_nm.append(row[3])
+                prev_func_nm = row[3]
+
+            for j in np.arange(0, row[5], sample_period):
+                x.append(x[-1] + sample_period)
+                y.append(y[-1])
+            y[-1] = y_val
+        plt.plot(x, y,  marker='o', c=colors[cnt], ms=1, label=labels[cnt])
+        plt.xlim([0.91, 0.92])
+        plt.ylim([0, 12000000])
+        plt.ylabel("Cummul. Counter Value")
+        plt.xlabel("Time (s)")
+
+
+
+        # print(func_line, x[0:10], y[0:10])
+        for i in range(len(func_line)):
+            plt.axvline(func_line[i], lw=1)
+            plt.text(func_line[i], 1000000, func_nm[i], rotation=90, fontsize=7)
+
+        plt.legend(loc=1)
+
+    plt.show()
 
 def main():
     # read_datafile(data_path + "single_run_test.csv")
